@@ -1,0 +1,325 @@
+---
+title: "Birds and Trees EDA"
+author: "Jennifer Kampe"
+date: "5/3/2022"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(blockmodels)
+library(randnet)
+library(greed)
+library(pheatmap)
+library(RColorBrewer)
+library(stringr)
+library(janitor)
+library(geobr)
+library(sf)
+library(ggplotify)
+library(gridExtra)
+
+library(foreach)
+library(doParallel)
+library(abind)
+```
+
+### Read and explore birds data
+```{r}
+# Read the cleaned, taxa-added data
+birds <- read.csv("./Data/atlantic_birds/birds_working.csv", header = TRUE)
+birds <- birds %>% rename(Bird_species = Species) %>%
+         mutate(data_source = "Atlantic Birds") 
+
+# Create data frame with just taxonomical information
+taxa <- read.csv("./Data/atlantic_birds/taxa_and_commonnames.csv", header = TRUE)
+
+```
+
+744 different species
+
+
+Load map data
+
+```{r}
+# Load Brazilian states
+states <- read_state(year=2020)
+
+## Plot all Brazilian states with sites colored by ecosystem type
+# Remove plot axis
+  no_axis <- theme(axis.title=element_blank(),
+                   axis.text=element_blank(),
+                   axis.ticks=element_blank())
+  
+  birds_summary <- birds %>% group_by(Longitude_x, Latitude_y, Olsoneconame, data_source) %>%
+  summarize(n = n()) %>%
+  rename(Ecosystem = Olsoneconame)
+  
+
+  ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = birds_summary, aes(x = Longitude_x, y=Latitude_y, color = Ecosystem, size = n), alpha = 0.3)  + 
+    labs(subtitle="Sampling Sites by Ecosystem", size=12) +
+    theme_minimal() +
+    scale_size(guide = "none") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+```
+
+Opacity indicates the number of records/species. 
+
+```{r}
+
+# Basic numbers
+length(unique(birds$Bird_species))
+
+nrow(birds_summary)
+```
+
+744 species, 585 different lat/long sites. Paper claims it's 745 species in 576 communities. 
+
+### Read and explore the trees data
+```{r}
+# Read data
+trees_T <- read.csv("./Data/Trees/T_tree_co.csv", header = TRUE, sep = ";") # traits for 1016 tree sp 
+trees_X <- read.csv("./Data/Trees/X_tree_co.csv", header = TRUE, sep = ";") # environmental covars at 574 sites
+trees_Y <- read.csv("./Data/Trees/Y_tree_co.csv", header = TRUE, sep = ";") # occurrences of 1016 tree sp at 574 site
+trees_xy <- read.csv("./Data/Trees/xy_tree_co.csv", header = TRUE, sep = ";") # lat long, ecosys for each of 574 sites
+trees_xy <- trees_xy %>% rename(Longitude_x = x, Latitude_y = y)
+
+# Cleaning
+colnames(trees_Y) <- gsub( "\\.", " ", colnames(trees_Y))
+trees_T %>% mutate(Plant_species = colnames(trees_Y))
+trees <- cbind(trees_xy, trees_Y) 
+
+# Create summary dataframe for plotting
+trees_summary <- trees
+trees_summary[, 4:ncol(trees)] <- ifelse(trees[, 4: ncol(trees)] > 0, 1, 0)
+trees_summary <- trees_summary %>% 
+                 mutate(data_source = "Atlantic Trees", 
+                        n = rowSums(trees_summary[, 4:ncol(trees)]))%>%
+                 dplyr::select(Longitude_x, Latitude_y, data_source, n)
+
+
+```
+
+
+
+Let's look at the locations of cites and restrict to the relevant region (Atlantic Forest)
+
+```{r}
+
+  ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = trees_xy, aes(x = Longitude_x, y=Latitude_y, color = as.factor(ecoreg)), alpha = 0.3)  + 
+    labs(subtitle="Sampling Sites by Ecoregion", size=12) +
+    theme_minimal() +
+    scale_size(guide = "none") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+
+```
+
+### Frugivory
+```{r}
+# Read data
+frug <- read.csv("./Data/Frugivory/ATLANTIC_frugivory.csv", header = TRUE)
+
+# Remove non-birds and non-trees
+frug <- frug %>%
+  filter(Frug_Class == "Aves" & (Plant_Form == "tree" | Plant_Form =="palm")) %>%
+  rename(Tree_species = Plant_Species, Longitude_x = Longitude, Latitude_y = Latitude, 
+         Bird_species = Frugivore_Species) %>%
+  mutate(Longitude_x = ifelse(Longitude_x >0, - Longitude_x, Longitude_x)) %>%
+  mutate(Longitude_x = ifelse((ID == 4616 | ID ==4625), NA, Longitude_x))%>% # typo lat = long 
+  mutate(data_source = "Atlantic Frugivory")
+
+# Check for NAs
+apply(frug, 2, function(x) sum(is.na(x)))
+sum(is.na(frug$Longitude_x) & is.na(frug$Study_Location))
+
+
+# Plot locations
+ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = frug, aes(x = Longitude_x, y=Latitude_y), alpha = 0.3)  + 
+    labs(subtitle="Sampling Sites by Ecoregion", size=12) +
+    theme_minimal() +
+    scale_size(guide = "none") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+
+
+frug_summary <- frug %>% group_by(Longitude_x, Latitude_y, data_source) %>%
+                summarize(n = n()) %>%
+                filter(!is.na(Longitude_x))
+
+```
+
+1519 of 4618 interactions are missing location data
+
+Now put them all together
+
+```{r}
+df <- bind_rows(birds_summary, trees_summary, frug_summary)
+
+ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = df, aes(x = Longitude_x, y=Latitude_y, color = data_source, size = n), alpha = 0.5)  + 
+    labs(subtitle="Sampling Sites by Data Source", color = " ", size = "Number of Species") +
+    theme_minimal() +
+    #scale_size(guide = "Number of Species/Interaction Pairs") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+
+
+ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = df, aes(x = Longitude_x, y=Latitude_y, color = data_source), alpha = 0.3)  + 
+    labs(subtitle="Sampling Sites by Data Source", size=12, color = " ") +
+    theme_minimal() +
+    scale_size(guide = "none") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+
+df_zoom <- df %>% filter(Longitude_x >-50 & Longitude_x < -35 & Latitude_y < -15 )
+ggplot() +
+    geom_sf(data=states, fill="white", color="black", size=.15, show.legend = FALSE) +
+    geom_point(data = df_zoom, aes(x = Longitude_x, y=Latitude_y, color = data_source), alpha = 0.3)  + 
+    xlim(c(-50, -30)) + ylim(c(-35, -15)) + 
+    labs(subtitle="Sampling Sites by Data Source", size=12, color = " ") +
+    theme_minimal() +
+    scale_size(guide = "none") + 
+    theme(text = element_text(family = "serif"))+
+    no_axis 
+
+```
+
+Now we check to see if we have occurrence data for all interactions
+
+```{r}
+birds_int <- unique(frug$Bird_species)
+trees_int <- unique(frug$Tree_species)
+
+### Check birds
+length(birds_int)
+sum(birds_int %in% birds$Bird_species)
+birds_int[7]
+
+# useful function
+sym_diff <- function(a,b) setdiff(union(a,b), intersect(a,b))
+
+## bad birds: birds in interactions but not Atlantic Birds
+table(frug[frug$Bird_species %in% birds_int[!(birds_int %in% taxa$Species)], ]$Bird_species)
+#View(taxa[order(taxa$Species),])
+frug <- frug %>% mutate(Bird_species = ifelse(Bird_species =="Thraupis bonariensis", "Pipraeidea bonariensis", Bird_species), 
+                        Bird_species = ifelse(Bird_species == "Thraupis palmarum", "Tangara palmarum", Bird_species), 
+                        Bird_species = ifelse(Bird_species == "Thraupis ornata", "Tangara ornata", Bird_species), 
+                        Bird_species = ifelse(Bird_species == "Thraupis sayaca", "Tangara sayaca", Bird_species))
+  
+
+#### Figure out if thraupis or tangara is correct
+
+## birds with only genus or weird spacing
+genusonly_birds <- birds_int[!grepl('^\\w+\\s\\w+$', birds_int)]
+sum(frug$Bird_species %in% genusonly_birds)
+frug <- frug %>% mutate(Bird_species = ifelse(Bird_species =="Ortalis guttata ", "Ortalis guttata", Bird_species))
+
+
+### Check trees
+length(trees_int)
+sum(trees_int %in% colnames(trees))
+trees_int[1]
+trees_int[4]
+
+sum(frug$Tree_species == trees_int[1])
+table(frug[frug$Tree_species %in% trees_int[!(trees_int %in% colnames(trees))], ]$Tree_species)
+frug <- frug %>% mutate(Tree_species = ifelse(Tree_species =="Schinus terebinthifolius", "Schinus terebinthifolia", Tree_species))
+```
+
+There are 226 distinct bird species recorded in interactions, of which, 192 also occur in the Atlantic Birds database. However, at least some of these seem to be due to classification changes (e.g. Thraupus palmarum versus Tangara palmarum) - I'll clean by hand. There are also 10 "bird species" which are actually just a genus, these account for only 60 of 4618 recorded interactions so I'm dropping them for now. 
+
+There are 313 distinct tree/palm species recorded in interactions, of which 197 also occur in the Atlantic Trees database. Acacia auriculiformis is in the interactions but not in the trees database - perhaps because non-native and tree database excludes planted and secondary forests. Alchornea discolor is in the interactions but not in the trees database, although many other Alcorneas are. "Allagoptera arenaria" is not in the trees database but it's a palm. "Byrsonima cydoniifolia" is not in the trees database, although many other Byrsonimas are. 
+
+Are these common interactions? The first missing acacia has 11 interactions recorded, Alchornea has only 1. There are some big ones missing, e.g., Schinus terebinthifolius - but this one should be Schinus terebinthifolia. So, it looks like I need to clean these by hand too. 
+
+Now suppose we're interested in bird occurrences. Do you have interactions for all birds?
+```{r}
+length(taxa$Species)
+length(birds_int)
+sum(taxa$Species %in% birds_int)
+
+length(colnames(trees_Y))
+length(trees_int)
+sum(colnames(trees_Y) %in% trees_int)
+```
+
+### Look at ecoregions
+```{r}
+table(birds$Olsoneconame)
+table(trees$ecoreg)
+
+```
+### Saving useful data
+For now, we treat each of the 708 lat-long-date-coderef combination as a distinct site and create one row for each. Note in some cases there are apparently two or more different observations as above, in which case a new replicate id is created to distinguish them. 
+
+```{r}
+# trees
+write.csv(trees, "./Data/Trees/trees_wide.csv", row.names = FALSE)
+trees_long <- trees %>% pivot_longer(!c(Longitude_x, Latitude_y, ecoreg), names_to = "Species_tree", values_to = "Count_tree") # don't really need this
+
+# birds
+birds_wide <- birds %>%   # Drop record id
+    select(-1) %>%
+    
+    # Create new binary variable for any occurrence at given site/time
+    mutate(occurrence = ifelse(RN_capt_100net_hours > 0 | PE_PAI > 0 | 
+                                 TRS_sight_hour >0, 1, 0)) %>%
+    
+    # Create new id for replicates above
+    group_by(ID_codref, Methods, Latitude_y, Longitude_x, Bird_species, 
+             Year_start, Year_finish) %>%
+    mutate(replicate = 1:n()) %>%
+    ungroup %>%
+    
+    select(ID_codref, Methods, Latitude_y, Longitude_x, Year_start,
+                                     Year_finish, Bird_species, Municipality, State, Habitat, Olsoneconame, 
+                                     OlsonG200r, Ribeirovegtype, BSRs, Altitude, Annual_rainfall, 
+                                     Annual_temperature, 
+                                     occurrence, replicate) %>%
+    
+    # Create wide df with species as variable
+    pivot_wider(names_from = Bird_species, values_from = occurrence, values_fill = 0) %>%
+    
+    # Clean NA's
+    mutate(Year_start = ifelse(is.na(Year_start), Year_finish, Year_start)) %>%
+    #mutate_all(~replace(., is.na(.), 0)) %>%
+  
+    # Put non-bird vars first and alphabetize species names
+    select(ID_codref, Methods, Latitude_y, Longitude_x, Year_start,
+                                     Year_finish, Municipality, State, Habitat, Olsoneconame, 
+                                     OlsonG200r, Ribeirovegtype, BSRs, Altitude, Annual_rainfall, 
+                                     Annual_temperature, replicate, sort(names(.)))
+
+
+apply(birds_wide, 2, function(x) sum(is.na(x)))
+
+write.csv(birds_wide, "./Data/atlantic_birds/birds_wide_genus_sp.csv", row.names = FALSE)
+
+# taxonomic distance: birds - omit pending phylogenetic data
+
+
+
+# frugivory
+write.csv(frug, "./Data/Frugivory/frug_clean.csv", row.names = FALSE)
+```
+
+### Questions and to-do
+- Clean tree taxonomy (Family is in the "frug" interaction data)
+- Translate ecoregions to be consistent between datasets: I don't know what the numbers in trees$ecoreg mean, don't correpond to anything in the cited database
+- Save clean files
+
+
