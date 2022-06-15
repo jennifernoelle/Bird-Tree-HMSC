@@ -1,0 +1,296 @@
+---
+title: "Atlantic Birds EDA"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loadpackages, include = FALSE}
+
+library(tidyverse)
+library(blockmodels)
+library(randnet)
+library(greed)
+library(pheatmap)
+library(RColorBrewer)
+library(stringr)
+library(janitor)
+
+```
+# This file creates the following files in ./Data/atlantic_birds/
+Define a "study" to be a single counting expedition as identified by the lat-long-method-date-IDcodref tuple. Then the most useful files are: 
+
+- birds_working.csv - this is the same format as the raw data (one row per species per study) but cleaned and with taxonomy added. Abundances are spread across many columns depending on the study methods
+- birds_wide_working.csv - this is the wide version (one row is per study). Abundances are replaced with binary occurrence indicators
+- birds_taxonomy.csv - this contains the taxonomic information for each species in the data, including common names and common family names (one row per species)
+
+
+# Data cleaning
+Note there appear to be duplicates: same species, latitude and longitde, trap method, and observed count, but different Record IDs ("identification code for each record") and or Code Reference IDs (identification code for each municipality sampled by study and sampling method). Techincally, if they have different Code Reference IDs, this should indicate that they are from different studies. However, given that the observed counts are equal to 6 or 7 digits (for net capture hours), it seems unlikely that these are in fact different studies and so duplicates are dropped. In contrst, for line transect, since TRS_sight_hours is only reported to one decimal place, duplicates with observations in that variable are retained. 
+
+Other cleaning: 15384 observations in various states have IDcodref 0. Create new unique IDcodrefs for each lat-long-date-method tuple
+```{r}
+
+# Read the data
+birds_quant <- read.csv("./Data/atlantic_birds/ATLANTIC_BIRDS_quantitative.csv")
+
+# Clean municipality names
+birds_quant$Municipality <- str_replace_all(birds_quant$Municipality, "[^[:upper:]]", "")
+      
+# Investigate duplicates
+dupes <- get_dupes(birds_quant[, 3:17])
+
+# Delete duplicates except for when the duplication occurs in TRS_sight_hour
+birds_quant_notrs <-  distinct(birds_quant[is.na(birds_quant$TRS_sight_hour), ], Latitude_y, Longitude_x, Year_start, Year_finish, Species, 
+                RN_capt_100net_hours, PE_PAI, 
+                Methods, .keep_all = T) 
+birds <- rbind(birds_quant_notrs, birds_quant[!is.na(birds_quant$TRS_sight_hour), ])
+
+# Look at species names
+birds$Species <- ifelse(birds$Species == "Tyranus melancholicus", "Tyrannus melancholicus", birds$Species)
+birds$Species <- ifelse(birds$Species == "Urubitinga urubitinga", "Buteogallus urubitinga", birds$Species)
+
+
+# Clean Olson ecosystem names
+birds$Olsoneconame <- ifelse(birds$Olsoneconame == "Alto Paran+\xed Atlantic forests", "Alto Parana Atlantic forests", birds$Olsoneconame)
+birds$Olsoneconame <- ifelse(is.na(birds$Olsoneconame), "Unknown", birds$Olsoneconame)  
+
+# Create new ID_codref for the 15384 observations with ID_codref == 0 and sites in different states, etc. 
+birds_0 <- birds %>% filter(ID_codref == 0) %>% 
+    select(ID_codref, Methods, Latitude_y, Longitude_x, Year_start, Year_finish) %>%
+    distinct() %>%
+    mutate(newID = paste0("MISS.",1:n()))
+birds <- left_join(birds, birds_0) %>%
+         mutate(ID_codref = ifelse(ID_codref==0, newID, ID_codref)) %>%
+         select(-newID)
+```
+
+# Compute adjacency matrices
+Now we compute the adjacency matrix, noting that we will have to create replicate ids for the retained replicates, i.e. sites with repeated obs (same site, time, method, but different count for mist net or point count, or same site, time, method, and even same count for line transect). 
+
+Currently I'm not modeling the diagonal, just replacing it with zero. Otherwise diagonal represents occurrence of a single species (i.e., number of sites/times it occurred). First we generate and adjacency matrix $A$ with $A_{ij}$ representing the number of site-times species $i$ and $j$ co-occurred, then generate a binary adjacency matrix whose entries are indicators for the vent that the species ever occur together (at any site, any time)
+
+```{r}
+# Convert to presence/absence data
+birds_wide <- birds %>% 
+  # Drop record id
+  select(-1) %>%
+  
+  # Create new binary variable for any occurrence at given site/time
+  mutate(occurrence = ifelse(RN_capt_100net_hours > 0 | PE_PAI > 0 | 
+                               TRS_sight_hour >0, 1, 0)) %>%
+  
+  # Create new id for replicates above
+  group_by(ID_codref, Methods, Latitude_y, Longitude_x, Species, 
+           Year_start, Year_finish) %>%
+  mutate(replicate = 1:n()) %>%
+  ungroup %>%
+  
+  select(ID_codref, Methods, Latitude_y, Longitude_x, Year_start,
+         Year_finish, Species, Municipality, State, Habitat, Olsoneconame, 
+         OlsonG200r, Ribeirovegtype, BSRs, Altitude, Annual_rainfall, 
+         Annual_temperature, 
+         occurrence, replicate) %>%
+  
+  # Create wide df with species as variable
+  pivot_wider(names_from = Species, values_from = occurrence, values_fill = 0) %>%
+  
+  # Clean NA's
+  mutate(Year_start = ifelse(is.na(Year_start), Year_finish, Year_start)) %>%
+  mutate_all(~replace(., is.na(.), 0))
+
+
+# Generate co-occurrence matrix with crossproduct
+occ <- as.matrix(birds_wide[-c(1:17)], nrow = nrow(birds_wide))
+comat <- t(occ) %*% occ
+diag(comat) <- 0
+
+
+# Create binary co-occurrence matrix
+comat_bin <- ifelse(comat > 0, 1, 0)
+
+```
+
+# Clean taxonomical data and create annotations 
+Clean species names and annotate by genus, family, etc. Note that Annotation is " a data frame that specifies the annotations shown on top of the columns. Each row defines the features for a specific column. The columns in the data and rows in the annotation are matched using corresponding row and column names. Note that color schemes takes into account if variable is continuous or discrete." 
+
+We obtain complete taxonomical information using all Aves records from BOLD, supplementing with research where there are species present in the Atlantic birds data set but missing in BOLD. Common names are from the IOC World Bird master lists here: https://www.worldbirdnames.org/new/ioc-lists/master-list-2/
+
+
+```{r cleaning}
+
+## Getting genus species
+#Get and assign shorter dim names by extracting genus, species
+genus_abbrev <- substr(colnames(occ), 1,3)
+genus <- gsub( " .*$", "", colnames(occ) )
+species <- data.frame(strsplit(colnames(occ), " "))[2,]
+g_sp <- paste(genus_abbrev, species, sep = ".")
+dimnames(comat) <- dimnames(comat_bin) <- list(g_sp, g_sp)
+
+# Investigate duplicates: all gone, but we need first three letters of genus
+dupes <- get_dupes(data.frame(g_sp))
+
+# Import full taxonomy
+taxa <- read.csv("./Data/atlantic_birds/bird_taxonomy.csv", header = TRUE)
+taxa <- distinct(taxa)
+
+## Create annotations
+# Merge
+annotation <- data.frame(Genus_species = colnames(occ))
+annotation <- left_join(annotation, taxa)
+
+# Check accuracy: Genus agrees unless NA
+sum(genus == annotation$Genus)
+sum(is.na(annotation$Genus))
+
+# Fill in missing taxa where obvious: if genus is same, then so are family and order
+annotation <- annotation %>% 
+  mutate(class = "Aves", 
+         Genus = ifelse(is.na(Genus), genus, Genus))
+order_fam <- annotation %>% 
+  select(-1) %>% 
+  na.omit %>%
+  distinct(.)
+
+annotation <- left_join(annotation, order_fam, by = "Genus") %>%
+  mutate(Order = ifelse(is.na(Order.x), Order.y, Order.x), 
+         Family = ifelse(is.na(Family.x), Family.y, Family.x), 
+         Class = "Aves") %>%
+  select(Genus_species, Class, Order, Family, Genus)
+  
+
+# Get dataframe of incomplete cases to edit, only need up to genus level
+# NA_taxa <- annotation %>%
+#     dplyr::setdiff(., na.omit(.)) %>%
+#     select(-1) %>%
+#     distinct()
+# write.csv(NA_taxa, "birds_missing_taxa.csv", row.names = FALSE)
+
+# Manually research missing taxa and patch
+taxa_patch <- read.csv("./Data/atlantic_birds/birds_updated_taxa.csv", header = TRUE)
+annotation <- left_join(annotation, taxa_patch, by = "Genus") %>%
+  mutate(Order = ifelse(is.na(Order.x), Order.y, Order.x), 
+         Family = ifelse(is.na(Family.x), Family.y, Family.x), 
+         Class = "Aves") %>%
+  select(Genus_species, Class, Order, Family, Genus)
+
+rownames(annotation) = g_sp
+
+# Merge with original data set for future use
+annotation2 <- annotation 
+annotation2$g_sp <- g_sp
+
+birds_taxa <- left_join(birds, annotation2, by = c("Species" = "Genus_species"))
+write.csv(birds_taxa, "./Data/atlantic_birds/birds_plus.csv", row.names = FALSE)
+
+```
+
+# Add common names 
+This file is very messy and family names are only provided for the first row to which they apply
+```{r}
+# Add common names 
+birds <- read.csv("./Data/atlantic_birds/birds_plus.csv", header = TRUE)
+master.names <- read.csv("./Data/atlantic_birds/master_ioc_list_v11.2.csv", header = TRUE)
+
+# Investigate all caps: these are overly broad not useful so we replace them with blanks
+cap <- str_trim(str_extract(master.names$Family..English., "([:upper:]|[:space:]){2,}"))
+table(cap)
+
+# Drop family groups (all caps) and fill in missing values (downward filling)
+good.names <- master.names %>% 
+  rename(family.common = Family..English., family = Family..Scientific., species = Species..Scientific., 
+         species.common = Species..English., genus = Genus) %>%
+  mutate(family.common = ifelse(family.common == "FLYING BIRDS" | family.common == "RATITES"|
+                            family.common == "WATERFOWL & LANDFOWL" | family.common == "TYPICAL BIRDS", "", family.common)) %>%
+  mutate_all(list(~na_if(.,""))) %>%
+  fill(family.common, family, genus) %>%
+  select(family, family.common, genus, species, species.common) %>%
+  mutate(genus.species = paste(genus, species)) %>%
+  na.omit %>%
+  select(family.common, family, genus.species, species.common)
+
+# Merge with abundance data: first just match families to their common names
+family_names <- unique(good.names[, 1:2])
+birds_names <- left_join(birds, family_names, by = c("Family" = "family"))
+birds_names <- left_join(birds_names, good.names[, -c(1,2)], by = c("Species" = "genus.species"))
+
+# Investigate missing common names: just browsing, these seem to be legitimately missing from the mastelist
+filter(birds_names, is.na(species.common)) %>%
+  select(Species) %>%
+  table
+
+# Replace missing common names with Family common name plus sp. 
+birds_names$species.common = ifelse(is.na(birds_names$species.common), paste0(birds_names$family.common, ": ", birds_names$Species), birds_names$species.common)
+
+# Save working data set: long with taxonomy added
+write.csv(birds_names, "./Data/atlantic_birds/birds_working.csv", row.names = FALSE)
+
+# Save taxonomy separately
+taxa_data <- birds_names %>%
+  select(Species, species.common, family.common, Class, Order, Family, Genus, g_sp) %>%
+  distinct()
+write.csv(taxa_data,  "./Data/atlantic_birds/taxa_and_commonnames.csv", row.names = FALSE)
+
+# Save wide data
+birds.dta <- compute.A(birds_names, taxa_data)
+birds_wide_data <- birds.dta[[4]]
+write.csv(birds_wide_data,  "./Data/atlantic_birds/birds_wide_working.csv", row.names = FALSE)
+```
+
+# Perform clustering with greed SBM and plot with annotations
+```{r}
+
+### Plot block structure using greed SBM
+set.seed(1)
+
+# Select number of clusters to initialize at using a variety of model selection 
+# criteria from randnet
+H_select <- rep(0,8)
+
+# Le and Levina (2015)
+bhmc <- BHMC.estimate(comat_bin,K.max=10)
+H_select[1] <- bhmc$K
+
+# Wang and Bickel (2017)
+lrbic <- LRBIC(comat_bin,Kmax=10)
+H_select[2] <- lrbic$SBM.K
+
+# Chen and Lei (2018)
+ncv <- NCV.select(comat_bin,max.K=10)
+H_select[3] <- which.min(ncv$l2)
+H_select[4] <- which.min(ncv$dev)
+
+# Li et al. (2020)
+ecv <- ECV.block(comat_bin,max.K=10)
+H_select[5] <- which.min(ecv$l2)
+H_select[6] <- which.min(ecv$dev)
+
+# Li et al. (2020)
+ecv.R <- ECV.Rank(comat_bin,10,weighted=FALSE,mode="undirected")
+H_select[7] <- ecv.R$sse.rank
+H_select[8] <- ecv.R$auc.rank
+
+sel_H <- round(median(H_select))
+
+## Full data set: binary adjacency matrix 
+greed_out1 <- greed(comat_bin, K=sel_H, model=new("sbm",type="undirected"), 
+                   alg=methods::new("hybrid"), verbose=FALSE)
+
+# point estimate
+g_sbm <- greed_out1@cl
+
+
+# Plot clusters: to display the block structures, re-order the rows and columns
+sel <- order(g_sbm)
+g_sbm <- g_sbm[sel]
+Y_greed1 <- (comat_bin)[sel,sel]
+pheatmap(Y_greed1, cluster_rows = F, cluster_cols = F,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Heatmap: Binary co-occurrence data \n  744 species, 72 blocks", 
+         fontsize = 20, show_rownames = F, show_colnames = F, 
+         legend = F, annotation = annotation)
+```
+
+

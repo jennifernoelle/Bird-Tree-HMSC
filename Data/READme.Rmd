@@ -1,0 +1,10 @@
+# Bird data
+birds_wide_genus_sp.csv: cleaned birds data with columns alphabetized scientific bird names, environmental covariates
+Each lat-long-date-idcoderef is treated as a separate observation, with replicates for observations as such repeated two or more times
+
+# Tree data
+trees_wide.csv: cleaned trees data with environmental covariates
+
+# Frugivory
+frug_clean.csv: cleaned interactions data with naming conflicts resolved in favor of birds naming scheme (e.g., Thraupis to Tangara)
+
