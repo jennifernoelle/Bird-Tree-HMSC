@@ -1,0 +1,159 @@
+---
+title: "Untitled"
+author: "Jennifer Kampe"
+date: "6/15/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE}
+# Load packages 
+library(Hmsc)
+library(tidyverse)
+library(magrittr)
+library(tibble)
+library(igraph)
+library(zoo)
+library(geobr)
+library(abind)
+library(vioplot)
+library(colorspace)
+library(knitr)
+```
+
+Load files
+
+```{r}
+frug <- read.csv("./Data/Frugivory/frug_clean.csv", header = TRUE)
+birds <- read.csv("./Data/atlantic_birds/birds_wide_genus_sp_covars.csv", header = TRUE)
+trees <- read.csv("./Data/Trees/trees_wide_covars.csv", header = TRUE)
+
+
+### SPECIES OCCURRENCE: select just the most common trees and convert to binary
+trees_occ <- trees[, which(colnames(trees)=="Abarema.cochliacarpos"):which(colnames(trees) =="Zygia.latifolia")]
+trees_occ <- ifelse(trees_occ > 0, 1, 0)
+ntrees <- 25
+commontrees <- colnames(trees_occ[, order(colSums(-trees_occ))])[1:ntrees]
+
+birds.df <- birds %>% 
+  mutate(Habitat2 = ifelse(Olsoneconame == "Alto Parana Atlantic forests" 
+                           | Olsoneconame == "Xingu-Tocantins-Araguaia moist forests", "Tropical Moist Forest", 
+                           ifelse(str_detect(birds$Olsoneconame, "interior"), "Interior Forest", 
+                                  ifelse(Olsoneconame == "Cerrado" | str_detect(birds$Olsoneconame, "savanna"), "Savanna", 
+                                         ifelse(str_detect(birds$Olsoneconame, "coastal")
+                                                | Olsoneconame == "Southern Atlantic mangroves", "Coastal Forest", 
+                                                ifelse(Olsoneconame =="Araucaria moist forests", "Temperate Forest", NA
+                                                       #ifelse(Olsoneconame == "Caatinga", "Shrubland", NA)
+                                                )))))) %>%
+  select(-c(Methods, Year_start, Year_finish, 
+            Habitat, State, replicate, year, name_biome, code_biome)) %>% 
+  relocate(Habitat2, .after = "ID_codref") %>%
+  na.omit
+
+
+## Species Occurrence: Y Select just the most common birds
+birds_occ <- birds.df[, which(colnames(birds.df)=="Aburria.jacutinga"):which(colnames(birds.df) == "Zonotrichia.capensis")]
+nbirds <- 10
+commonbirds <- colnames(birds_occ[, order(colSums(-birds_occ))])[1:nbirds]
+
+# Get adjacency matrix
+frug.common <- frug %>%
+  mutate(Bird_species = gsub(" ", ".", Bird_species),
+         Tree_species = gsub(" ", ".", Tree_species)) %>% 
+  filter(Bird_species %in% commonbirds, Tree_species %in% commontrees)
+
+```
+
+Look at interaction data. Should restrict to those being used in model
+```{r}
+el <- as.data.frame(frug.common[, c(2,3)])
+t.el <- table(el)
+g <- graph.incidence(t.el, weighted = TRUE)
+LO <- layout_as_bipartite(g)
+colrs <- c("light blue", "coral")[V(g)$type + 1L]
+plot(g, vertex.color = colrs, layout = LO[, 2:1], vertex.label.cex = 0.75)
+
+```
+
+# Model 1: 10 birds, predicted using 25 trees using frugivory-informed priors
+```{r}
+
+# Look at tree fit
+filename0 = "Models/mod1trees_HMSC.Rdata"
+load(filename0)
+# MCMC diagnostics
+m1posttrees <- convertToCodaObject(mod1trees_HMSC)
+hist(effectiveSize(m1posttrees$Beta), main="ess(beta)")
+hist(gelman.diag(m1posttrees$Beta, multivariate=FALSE)$psrf, main="psrf(beta)")
+
+# Look at params
+postBeta = getPostEstimate(mod1trees_HMSC, parName = "Beta")
+plotBeta(mod1trees_HMSC, post = postBeta, param = "Support", supportLevel = 0.95)
+
+# Look at fit
+preds.spatial.trees1 = computePredictedValues(mod1trees_HMSC)
+MF.spatial.trees1= evaluateModelFit(hM=mod1trees_HMSC, predY=preds.spatial.trees1)
+MF.spatial.trees1
+
+filename1 = "Models/mod1_HMSC.Rdata"
+load(filename1)
+
+# MCMC diagnostics
+m1post <- convertToCodaObject(mod1_HMSC)
+hist(effectiveSize(m1post$Beta), main="ess(beta)")
+hist(gelman.diag(m1post$Beta, multivariate=FALSE)$psrf, main="psrf(beta)")
+
+# Look at params
+postBeta = getPostEstimate(mod1_HMSC, parName = "Beta")
+plotBeta(mod1_HMSC, post = postBeta, param = "Support", supportLevel = 0.95)
+
+# Look at fit
+preds.spatial.1 = computePredictedValues(mod1_HMSC)
+MF.spatial.1= evaluateModelFit(hM=mod1_HMSC, predY=preds.spatial.1)
+
+
+filename2 = "Models/mod2_HMSC.Rdata"
+load(filename2)
+# Look at fit
+preds.spatial.2 = computePredictedValues(mod1_HMSC)
+MF.spatial.2= evaluateModelFit(hM=mod1_HMSC, predY=preds.spatial.2)
+
+
+filename3 = "Models/mod3_HMSC.Rdata"
+load(filename3)
+# Look at fit
+preds.spatial.3 = computePredictedValues(mod3_HMSC)
+MF.spatial.3= evaluateModelFit(hM=mod3_HMSC, predY=preds.spatial.3)
+
+```
+
+# Compare Fit:RMSE
+```{r}
+df.rmse <- as.data.frame(rbind(MF.spatial.1$RMSE, MF.spatial.2$RMSE, MF.spatial.3$RMSE))
+row.names(df.rmse) <- c("Trees+", "Trees", "No Trees")
+colnames(df.rmse) <- commonbirds
+kable(df.rmse)
+```
+
+# Compare Fit: AUC
+```{r}
+df.auc <- as.data.frame(rbind(MF.spatial.1$AUC, MF.spatial.2$AUC, MF.spatial.3$AUC))
+row.names(df.auc) <- c("Trees+", "Trees", "No Trees")
+colnames(df.auc) <- commonbirds
+kable(df.auc)
+```
+
+Modifications / To Do
+
+- Look at the quality of tree predictions at held out locations not immediately next to observed locations
+- Modify included plants and trees to be common in the frugivory dataset rather than common in the disctinct bird, tree sets
+- Run longer
+- Replace variable selection prior probs with Georgia posterior estimates
+- Add globally available climate and landuse data 
+- Indirect interactions?
+- Negative interactions - habitat proxy? - inclue tree PCs to cover habitat

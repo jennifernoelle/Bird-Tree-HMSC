@@ -35,6 +35,8 @@ library(igraph)
 library(zoo)
 library(geobr)
 library(abind)
+library(vioplot)
+library(colorspace)
 
 # Load data
 birds <- read.csv("./Data/atlantic_birds/birds_wide_genus_sp_covars.csv", header = TRUE)
@@ -177,18 +179,33 @@ model1.trees <- Hmsc(Y=Y.trees, XData = X.env.trees, XFormula = XFormula.trees,
                distr = "probit" )
 
 # Fit model
-thin = 10
-samples = 50
+## Run the models
 nChains = 2
-transient = 50
+test.run = FALSE
+if (test.run){
+  #with this option, the vignette runs fast but results are not reliable
+  thin = 1
+  samples = 10
+  transient = 5
+  verbose = 1
+} else {
+  #with this option, the vignette evaluates slow but it reproduces the results of the
+  #.pdf version
+  thin = 10
+  samples = 250
+  transient = 250*thin
+  verbose = 10
+}
 
 mod1trees_HMSC = sampleMcmc(model1.trees,
                        samples = samples,
                        thin = thin,
                        transient = transient,
-                       #nChains = nChains, 
-                       #nParallel = nChains
+                       nChains = nChains, 
+                       nParallel = nChains
                        )
+
+save(mod1trees_HMSC,file="Models/mod1trees_HMSC.Rdata")
 
 
 ##################### STEP 2: BIRDS HMSC USING TREES AS A COVARIATE ###############
@@ -213,7 +230,7 @@ birds.df <- birds %>%
 
 ## Species Occurrence: Y Select just the most common birds
 birds_occ <- birds.df[, which(colnames(birds.df)=="Aburria.jacutinga"):which(colnames(birds.df) == "Zonotrichia.capensis")]
-nbirds <- 25
+nbirds <- 10
 commonbirds <- colnames(birds_occ[, order(colSums(-birds_occ))])[1:nbirds]
 Y <- as.matrix(birds_occ[, which(colnames(birds_occ) %in% commonbirds)])
 Y <- Y[, order(colnames(Y))] # make sure it's alphabetized
@@ -293,8 +310,6 @@ Epred.trees <- apply(abind(pred.trees, along = 3), c(1,2), mean) # Get posterior
 Epred.trees <- cbind(Epred.trees, xy.coords.new.unique)
 birds.df <- left_join(birds.df, Epred.trees) # Join by centers_long, centers_lat to expand preds to duplicated locations
 
-
-
 # Get adjacency matrix
 frug.common <- frug %>%
   mutate(Bird_species = gsub(" ", ".", Bird_species),
@@ -319,25 +334,32 @@ A.full <- A.full[order(row.names(A.full)), order(colnames(A.full))] # alphabetiz
 # Use adjacency matrix for variable selection: simple version for now
 # Eventually use posterior interaction probablities from Georgia's model
 # If no observed interaction, set prior prob for tree covar to 0.5, otherwise include tree covar with prob 1
-A.prior <- ifelse(A.full == 0, 0.5, 1)
+A.prior <- ifelse(A.full == 0, 0.4, 1)
 Xsel <- list()
 for(j in 1:ntrees){
  Xsel[[j]] <- list(covGroup = c(j), spGroup = 1:nbirds, q = A.prior[, j] ) 
 }
 
 
-# Environmental features
-X.env <- birds.df[, c(which(colnames(birds.df) == "Alchornea.triplinervia"):
+# Environmental features: set up for models with and without trees
+X.env.trees <- birds.df[, c(which(colnames(birds.df) == "Alchornea.triplinervia"):
                     which(colnames(birds.df) == "Zanthoxylum.rhoifolium"))] %>%
-         cbind(.,birds.df[, c("Habitat2","Annual_temperature")]) %>%
+         cbind(.,birds.df[, c("Habitat2","Annual_temperature", "Annual_rainfall", 
+                              "Altitude")]) %>%
          mutate(Habitat2 = as.factor(Habitat2)) 
-X.env <- cbind(pred.trees, X.env) # trees are at the beginning, first covariate group
-XFormula = ~  poly(Annual_temperature,degree = 2, raw=TRUE) + Habitat2 +
-  paste(colnames(A.prior), collapse=' + ')
-##### Fix this: get colnames into formula
+
+XFormula.trees = as.formula(paste(" ~ poly(Annual_temperature,degree = 2, raw=TRUE) +
+                                  poly(Annual_rainfall, degree = 2, raw=TRUE) + 
+                                  Altitude + Habitat2 + ", 
+                                  paste(colnames(A.prior), collapse=' + ')))
+
+X.env <- birds.df[, c("Habitat2","Annual_temperature", "Annual_rainfall", "Altitude")] %>%
+  mutate(Habitat2 = as.factor(Habitat2)) 
+
+XFormula = ~ poly(Annual_temperature,degree = 2, raw=TRUE) + 
+             poly(Annual_rainfall, degree = 2, raw=TRUE) + Altitude + Habitat2 
 
 
-# Altitude+ Annual_rainfall + poly(Annual_temperature,degree = 2, raw=TRUE) + Habitat2
 
 # Traits
 Tr.temp <- taxa %>%
@@ -351,32 +373,86 @@ Tr <- Tr.temp[order(row.names(Tr.temp)), ] %>%
 TrFormula = ~ Order
 
 
-# Run model
-# Define model 
-model1 <- Hmsc(Y=Y, XData = X.env, XFormula = XFormula, 
+
+## Define models
+
+# 1 - uses trees and interaction information
+model1 <- Hmsc(Y=Y, XData = X.env.trees, XFormula = XFormula.trees, XSelect = Xsel,
                TrData = NULL, TrFormula = NULL, 
                studyDesign = studyDesign.birds,
                ranLevels = list("block.id" = rL.spatial.birds), distr = "probit" )
 
-thin = 10
-samples = 1000
-nChains = 2
-transient = 1000
+# 2 - trees but no selection
+model2 <- Hmsc(Y=Y, XData = X.env.trees, XFormula = XFormula.trees,
+               TrData = NULL, TrFormula = NULL, 
+               studyDesign = studyDesign.birds,
+               ranLevels = list("block.id" = rL.spatial.birds), distr = "probit" )
 
-thin = 1
-samples = 50
-nChains = 2
-transient = 50
+# 3 - no trees
+model3 <- Hmsc(Y=Y, XData = X.env, XFormula = XFormula,
+               TrData = NULL, TrFormula = NULL, 
+               studyDesign = studyDesign.birds,
+               ranLevels = list("block.id" = rL.spatial.birds), distr = "probit" )
 
+## Run the models
+nChains = 2
+test.run = FALSE
+if (test.run){
+  #with this option, the vignette runs fast but results are not reliable
+  thin = 1
+  samples = 10
+  transient = 5
+  verbose = 1
+} else {
+  #with this option, the vignette evaluates slow but it reproduces the results of the
+  #.pdf version
+  thin = 10
+  samples = 250
+  transient = 250*thin
+  verbose = 10
+}
+
+# Model 1: trees and interactions
 mod1_HMSC = sampleMcmc(model1,
                       samples = samples,
                       thin = thin,
                       transient = transient,
                       nChains = nChains, 
                       nParallel = nChains)
-preds.spatial = computePredictedValues(mod1_HMSC)
-MF.spatial = evaluateModelFit(hM=mod1_HMSC, predY=preds.spatial)
-MF.spatial
+save(mod1_HMSC,file="Models/mod1_HMSC.Rdata")
+
+# MCMC diagnostics
+m1post <- convertToCodaObject(mod1_HMSC)
+hist(effectiveSize(m1post$Beta), main="ess(beta)")
+hist(gelman.diag(m1post$Beta, multivariate=FALSE)$psrf, main="psrf(beta)")
+
+# Look at params
+postBeta = getPostEstimate(mod1_HMSC, parName = "Beta")
+plotBeta(mod1_HMSC, post = postBeta, param = "Support", supportLevel = 0.95)
+
+# Look at fit
+preds.spatial.1 = computePredictedValues(mod1_HMSC)
+MF.spatial.1= evaluateModelFit(hM=mod1_HMSC, predY=preds.spatial.1)
+MF.spatial.1
+
+
+mod2_HMSC = sampleMcmc(model2,
+                       samples = samples,
+                       thin = thin,
+                       transient = transient,
+                       nChains = nChains, 
+                       nParallel = nChains)
+save(mod2_HMSC,file="Models/mod2_HMSC.Rdata")
+
+
+mod3_HMSC = sampleMcmc(model3,
+                       samples = samples,
+                       thin = thin,
+                       transient = transient,
+                       nChains = nChains, 
+                       nParallel = nChains)
+save(mod3_HMSC,file="Models/mod3_HMSC.Rdata")
+
 
   
 
